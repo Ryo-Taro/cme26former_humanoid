@@ -2,84 +2,248 @@ import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
 import imageio
+import os
+from datetime import datetime
 
-# =====================
-# 改良版制御
-# =====================
-def get_action(env):
-    data = env.unwrapped.data
-
-    qpos = data.qpos.copy()
-    qvel = data.qvel.copy()
-
-    # ---- 関節部分 ----
-    qpos_act = qpos[7:]
-    qvel_act = qvel[6:]
-
-    # ---- 対称な目標姿勢 ----
-    target = np.zeros_like(qpos_act)
-
-    # ---- 右脚 ----
-    target[0] = -0.25   # hip (前後)
-    target[1] = 0.05    # hip (左右)
-    target[3] = 0.5     # knee
-    target[6] = -0.15   # ankle
-
-    # ---- 左脚 ----
-    target[7] = -0.25
-    target[8] = -0.05
-    target[10] = 0.5
-    target[13] = -0.15
-
-
-    # ---- 基本PD ----
-    kp = 100.0
-    kd = 8.0
-    action = kp * (target - qpos_act) - kd * qvel_act
-
-    # ---- COM制御 ----
-    com = data.subtree_com[0]
-    com_vel = data.cvel[0][:3]
-
-    com_x = com[0]
-    com_y = com[1]
-
-    # ---- 前後補正 ----
-    action[0] += -80.0 * com_x - 8.0 * com_vel[0]   # 右hip
-    action[6] += -60.0 * com_x                      # 右ankle
-
-    action[7] += -80.0 * com_x - 8.0 * com_vel[0]   # 左hip
-    action[13] += -60.0 * com_x                     # 左ankle
-
-    # ---- 左右補正（ここが追加ポイント）----
-    action[1] += -60.0 * com_y   # 右hip lateral
-    action[8] += -60.0 * com_y   # 左hip lateral
-
-    # ---- トルク制限 ----
-    return np.clip(action, -1.0, 1.0)
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from gymnasium import Wrapper
 
 
 # =====================
-# 実行
+# Reward Logger Callback
+# =====================
+class RewardLoggerCallback(BaseCallback):
+    def __init__(self):
+        super().__init__()
+        self.episode_rewards = []
+        self.current_reward = 0.0
+
+    def _on_step(self) -> bool:
+        reward = self.locals["rewards"][0]
+        done = self.locals["dones"][0]
+
+        self.current_reward += reward
+
+        if done:
+            self.episode_rewards.append(self.current_reward)
+            self.current_reward = 0.0
+
+        return True
+
+
+# =====================
+# checkpoint utilities
+# =====================
+def save_checkpoint(model, save_dir="checkpoints"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(save_dir, f"model_{timestamp}")
+
+    model.save(path)
+    print(f"✅ checkpoint保存: {path}.zip")
+
+
+def load_latest_checkpoint(env, save_dir="checkpoints"):
+    if not os.path.exists(save_dir):
+        return None
+
+    files = [f for f in os.listdir(save_dir) if f.endswith(".zip")]
+
+    if len(files) == 0:
+        return None
+
+    latest_file = sorted(files)[-1]
+    latest_path = os.path.join(save_dir, latest_file)
+
+    print(f"✅ 最新checkpointロード: {latest_path}")
+
+    return PPO.load(latest_path, env=env)
+
+
+# =====================
+# Target Pose
+# =====================
+class TargetPose:
+    def __init__(self, env):
+        data = env.unwrapped.data
+        self.qpos_target = data.qpos.copy()
+        self.height = data.qpos[2]
+        self.com = np.array([0.0, 0.0])
+
+
+# =====================
+# Controller
+# =====================
+class PostureCOMController:
+    def __init__(self, target):
+        self.target = target
+
+    def get_action(self, env):
+        data = env.unwrapped.data
+
+        qpos = data.qpos.copy()
+        qvel = data.qvel.copy()
+
+        q = qpos[7:]
+        qd = qvel[6:]
+        q_target = self.target.qpos_target[7:]
+
+        action = np.zeros_like(q)
+
+        q_error = q - q_target
+        action += -100.0 * q_error - 10.0 * qd
+
+        com = data.subtree_com[0]
+        com_vel = data.cvel[0][:3]
+
+        ex = com[0] - self.target.com[0]
+        ey = com[1] - self.target.com[1]
+
+        action[0] += -10 * ex - 10 * com_vel[0]
+        action[1] += -60 * ey - 5 * com_vel[1]
+        action[7] += -10 * ex - 10 * com_vel[0]
+        action[8] += -60 * ey - 5 * com_vel[1]
+
+        return action
+
+
+# =====================
+# RL Wrapper
+# =====================
+class PostureResidualWrapper(Wrapper):
+    def __init__(self, env, target):
+        super().__init__(env)
+        self.target = target
+        self.controller = PostureCOMController(target)
+
+    def step(self, action_rl):
+        base_action = self.controller.get_action(self.env)
+
+        action = base_action + action_rl
+        action = np.clip(action, -5.0, 5.0)
+
+        obs, _, terminated, truncated, info = self.env.step(action)
+
+        data = self.env.unwrapped.data
+        qpos = data.qpos.copy()
+        qvel = data.qvel.copy()
+
+        q = qpos[7:]
+        qd = qvel[6:]
+        q_target = self.target.qpos_target[7:]
+
+        q_error = q - q_target
+        com = data.subtree_com[0]
+        height = qpos[2]
+
+        reward = 0.0
+        reward -= 5.0 * np.sum(q_error**2)
+        reward -= 0.1 * np.sum(qd**2)
+        reward -= 1.0 * np.sum((com[:2] - self.target.com)**2)
+        reward -= 0.01 * np.sum(action_rl**2)
+
+        if height < 0.8:
+            reward -= 10.0
+            terminated = True
+
+        return obs, reward, terminated, truncated, info
+
+
+# =====================
+# 環境構築
+# =====================
+env_tmp = gym.make("Humanoid-v5")
+target = TargetPose(env_tmp)
+env_tmp.close()
+
+env_train = gym.make("Humanoid-v5")
+env_train = PostureResidualWrapper(env_train, target)
+
+
+# =====================
+# モデル生成 or 再開
+# =====================
+model = load_latest_checkpoint(env_train)
+
+if model is None:
+    print("✅ 新規モデル作成")
+
+    model = PPO(
+        "MlpPolicy",
+        env_train,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=128,
+        gamma=0.97,
+        gae_lambda=0.95,
+        clip_range=0.5,
+        ent_coef=0.001,
+    )
+else:
+    print("✅ checkpointから再開")
+
+
+# =====================
+# 学習
+# =====================
+callback = RewardLoggerCallback()
+
+model.learn(
+    total_timesteps=10_000,
+    callback=callback
+)
+
+save_checkpoint(model)
+env_train.close()
+
+
+# =====================
+# 学習報酬プロット
+# =====================
+plt.figure()
+plt.plot(callback.episode_rewards)
+plt.title("Training Reward per Episode")
+plt.xlabel("Episode")
+plt.ylabel("Total Reward")
+plt.savefig("training_reward.png")
+plt.close()
+
+
+# =====================
+# 評価 + 動画
 # =====================
 env = gym.make("Humanoid-v5", render_mode="rgb_array")
+env = PostureResidualWrapper(env, target)
+
+model = load_latest_checkpoint(env)
+
+if model is None:
+    model = PPO.load("humanoid_posture_rl")
 
 obs, _ = env.reset()
 
 frames = []
+action_history = []
+q_error_history = []
+qpos_history = []
 
-steps = 1000
-survival_steps = 0
-
-for step in range(steps):
-    action = get_action(env)
-
+for step in range(1000):
+    action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, _ = env.step(action)
 
-    frame = env.render()
-    frames.append(frame)
+    frames.append(env.render())
 
-    survival_steps = step
+    data = env.unwrapped.data
+    qpos = data.qpos.copy()
+    q = qpos[7:]
+    q_target = target.qpos_target[7:]
+
+    action_history.append(action)
+    qpos_history.append(qpos)
+    q_error_history.append(np.linalg.norm(q - q_target))
 
     if terminated or truncated:
         print(f"✅ 転倒 at step {step}")
@@ -87,21 +251,54 @@ for step in range(steps):
 
 env.close()
 
+
 # =====================
 # GIF保存
 # =====================
-imageio.mimsave("humanoid.gif", frames, fps=30)
+imageio.mimsave("humanoid_posture.gif", frames, fps=30)
 
-print(f"✅ 生存ステップ数: {survival_steps}")
-print("✅ humanoid.gif 保存完了")
 
 # =====================
-# 高さプロット
+# データ整形
 # =====================
-heights = [f[0][0] for f in frames]  # 簡易化
+qpos_history = np.array(qpos_history)
+q_history = qpos_history[:, 7:]
+q_target = target.qpos_target[7:]
+action_history = np.array(action_history)
 
-plt.plot(heights)
-plt.title("Approx Height Trend")
-plt.xlabel("Step")
-plt.ylabel("Height-like")
-plt.show()
+
+# =====================
+# 誤差プロット
+# =====================
+plt.figure()
+plt.plot(q_error_history)
+plt.title("Posture Tracking Error")
+plt.savefig("posture_error.png")
+plt.close()
+
+
+# =====================
+# qpos
+# =====================
+plt.figure()
+for i in range(min(5, q_history.shape[1])):
+    plt.plot(q_history[:, i], label=f"qpos_{i}")
+    plt.hlines(q_target[i], 0, len(q_history), linestyles='dashed')
+
+plt.title("Tracking vs Target")
+plt.legend()
+plt.savefig("qpos_tracking.png")
+plt.close()
+
+
+# =====================
+# action
+# =====================
+plt.figure()
+for i in range(min(5, action_history.shape[1])):
+    plt.plot(action_history[:, i], label=f"action_{i}")
+
+plt.title("Action")
+plt.legend()
+plt.savefig("action.png")
+plt.close()

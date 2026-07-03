@@ -1,3 +1,7 @@
+# For this project, we will ignore the following files and directories:
+checkpoints/
+
+
 # Byte-compiled / optimized files
 __pycache__/
 *.py[cod]
