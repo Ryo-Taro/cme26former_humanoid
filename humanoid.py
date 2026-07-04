@@ -11,7 +11,7 @@ from gymnasium import Wrapper
 
 
 # =====================
-# Reward Logger Callback
+# Reward Logger
 # =====================
 class RewardLoggerCallback(BaseCallback):
     def __init__(self):
@@ -33,14 +33,12 @@ class RewardLoggerCallback(BaseCallback):
 
 
 # =====================
-# checkpoint utilities
+# checkpoint
 # =====================
 def save_checkpoint(model, save_dir="checkpoints"):
     os.makedirs(save_dir, exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(save_dir, f"model_{timestamp}")
-
     model.save(path)
     print(f"✅ checkpoint保存: {path}.zip")
 
@@ -50,7 +48,6 @@ def load_latest_checkpoint(env, save_dir="checkpoints"):
         return None
 
     files = [f for f in os.listdir(save_dir) if f.endswith(".zip")]
-
     if len(files) == 0:
         return None
 
@@ -58,7 +55,6 @@ def load_latest_checkpoint(env, save_dir="checkpoints"):
     latest_path = os.path.join(save_dir, latest_file)
 
     print(f"✅ 最新checkpointロード: {latest_path}")
-
     return PPO.load(latest_path, env=env)
 
 
@@ -69,7 +65,6 @@ class TargetPose:
     def __init__(self, env):
         data = env.unwrapped.data
         self.qpos_target = data.qpos.copy()
-        self.height = data.qpos[2]
         self.com = np.array([0.0, 0.0])
 
 
@@ -92,25 +87,24 @@ class PostureCOMController:
 
         action = np.zeros_like(q)
 
-        q_error = q - q_target
-        action += -100.0 * q_error - 10.0 * qd
+        # ↓ 弱めたPD
+        action += -20.0 * (q - q_target) - 2.0 * qd
 
+        # COM制御（弱め）
         com = data.subtree_com[0]
-        com_vel = data.cvel[0][:3]
+        com_vel = data.cvel[0][:2]
 
-        ex = com[0] - self.target.com[0]
-        ey = com[1] - self.target.com[1]
+        ex = com[0]
+        ey = com[1]
 
-        action[0] += -10 * ex - 10 * com_vel[0]
-        action[1] += -60 * ey - 5 * com_vel[1]
-        action[7] += -10 * ex - 10 * com_vel[0]
-        action[8] += -60 * ey - 5 * com_vel[1]
+        action[0] += -5 * ex - 2 * com_vel[0]
+        action[1] += -10 * ey - 2 * com_vel[1]
 
         return action
 
 
 # =====================
-# RL Wrapper
+# Wrapper
 # =====================
 class PostureResidualWrapper(Wrapper):
     def __init__(self, env, target):
@@ -121,8 +115,9 @@ class PostureResidualWrapper(Wrapper):
     def step(self, action_rl):
         base_action = self.controller.get_action(self.env)
 
-        action = base_action + action_rl
-        action = np.clip(action, -5.0, 5.0)
+        # ✅ residualを小さく
+        action = base_action + 0.1 * action_rl
+        action = np.clip(action, -1.0, 1.0)
 
         obs, _, terminated, truncated, info = self.env.step(action)
 
@@ -138,21 +133,25 @@ class PostureResidualWrapper(Wrapper):
         com = data.subtree_com[0]
         height = qpos[2]
 
+        weights_error = np.ones_like(q_error)
+        weights_error[1] = 5.0   # ← qpos_1を強化
+
+        # ✅ 正規化したreward
         reward = 0.0
-        reward -= 5.0 * np.sum(q_error**2)
-        reward -= 0.1 * np.sum(qd**2)
-        reward -= 1.0 * np.sum((com[:2] - self.target.com)**2)
-        reward -= 0.01 * np.sum(action_rl**2)
+        reward -= 0.5 * np.sum(weights_error * (q_error**2))
+        reward -= 0.01 * np.sum(qd**2)
+        reward -= 0.5 * np.sum((com[:2])**2)
+        reward -= 0.001 * np.sum(action_rl**2)
 
         if height < 0.8:
-            reward -= 10.0
+            reward -= 5.0
             terminated = True
 
         return obs, reward, terminated, truncated, info
 
 
 # =====================
-# 環境構築
+# 環境
 # =====================
 env_tmp = gym.make("Humanoid-v5")
 target = TargetPose(env_tmp)
@@ -163,7 +162,7 @@ env_train = PostureResidualWrapper(env_train, target)
 
 
 # =====================
-# モデル生成 or 再開
+# モデル
 # =====================
 model = load_latest_checkpoint(env_train)
 
@@ -177,10 +176,10 @@ if model is None:
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=128,
-        gamma=0.97,
+        gamma=0.995,          # ✅ 長期重視
         gae_lambda=0.95,
-        clip_range=0.5,
-        ent_coef=0.001,
+        clip_range=0.2,       # ✅ 安定化
+        ent_coef=0.001,       # ✅ 探索
     )
 else:
     print("✅ checkpointから再開")
@@ -192,7 +191,7 @@ else:
 callback = RewardLoggerCallback()
 
 model.learn(
-    total_timesteps=10_000,
+    total_timesteps=18_000_000,
     callback=callback
 )
 
