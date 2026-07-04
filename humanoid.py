@@ -134,14 +134,18 @@ class PostureResidualWrapper(Wrapper):
         height = qpos[2]
 
         weights_error = np.ones_like(q_error)
-        weights_error[1] = 5.0   # ← qpos_1を強化
+        weights_error[0] = 8.0
+        weights_error[2] = 6.0
+        weights_error[16] = 8.0
+        weights_error[1] = 5.0
 
-        # ✅ 正規化したreward
+        # 報酬
         reward = 0.0
         reward -= 0.5 * np.sum(weights_error * (q_error**2))
-        reward -= 0.01 * np.sum(qd**2)
+        # reward -= 0.01 * np.sum(qd**2)
         reward -= 0.5 * np.sum((com[:2])**2)
         reward -= 0.001 * np.sum(action_rl**2)
+        reward += 0.5   # 生存報酬
 
         if height < 0.8:
             reward -= 5.0
@@ -176,10 +180,10 @@ if model is None:
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=128,
-        gamma=0.995,          # ✅ 長期重視
+        gamma=0.98,           # ✅ 長期重視
         gae_lambda=0.95,
         clip_range=0.2,       # ✅ 安定化
-        ent_coef=0.001,       # ✅ 探索
+        ent_coef=0.05,       # ✅ 探索
     )
 else:
     print("✅ checkpointから再開")
@@ -191,7 +195,7 @@ else:
 callback = RewardLoggerCallback()
 
 model.learn(
-    total_timesteps=18_000_000,
+    total_timesteps=180_000,
     callback=callback
 )
 
@@ -280,7 +284,7 @@ plt.close()
 # qpos
 # =====================
 plt.figure()
-for i in range(min(5, q_history.shape[1])):
+for i in range(q_history.shape[1]):
     plt.plot(q_history[:, i], label=f"qpos_{i}")
     plt.hlines(q_target[i], 0, len(q_history), linestyles='dashed')
 
@@ -294,7 +298,7 @@ plt.close()
 # action
 # =====================
 plt.figure()
-for i in range(min(5, action_history.shape[1])):
+for i in range(action_history.shape[1]):
     plt.plot(action_history[:, i], label=f"action_{i}")
 
 plt.title("Action")
