@@ -122,8 +122,11 @@ class CheckpointEvalCallback(BaseCallback):
         # =====================
         plt.figure()
         for i in range(q.shape[1]):
-            plt.plot(q[:, i])
+            plt.plot(q[:, i], label=f"qpos_{i}")
         plt.title(f"qpos_{tag}")
+        plt.xlabel("Step")
+        plt.ylabel("Qpos")
+        plt.legend()
         plt.savefig(os.path.join(self.fig_dir, f"qpos_{tag}.png"))
         plt.close()
 
@@ -132,8 +135,11 @@ class CheckpointEvalCallback(BaseCallback):
         # =====================
         plt.figure()
         for i in range(qd.shape[1]):
-            plt.plot(qd[:, i])
+            plt.plot(qd[:, i], label=f"qvel_{i}")
         plt.title(f"qvel_{tag}")
+        plt.xlabel("Step")
+        plt.ylabel("Qvel")
+        plt.legend()
         plt.savefig(os.path.join(self.fig_dir, f"qvel_{tag}.png"))
         plt.close()
 
@@ -142,8 +148,11 @@ class CheckpointEvalCallback(BaseCallback):
         # =====================
         plt.figure()
         for i in range(action_history.shape[1]):
-            plt.plot(action_history[:, i])
+            plt.plot(action_history[:, i], label=f"action_{i}")
         plt.title(f"action_{tag}")
+        plt.xlabel("Step")
+        plt.ylabel("Action")
+        plt.legend()
         plt.savefig(os.path.join(self.fig_dir, f"action_{tag}.png"))
         plt.close()
 
