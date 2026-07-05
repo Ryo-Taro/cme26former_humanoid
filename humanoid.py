@@ -7,6 +7,16 @@ from datetime import datetime
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
+
+# =====================
+# 設定
+# =====================
+num_envs = 64
+total_timesteps = 20_000_000_000
+n_steps = 1024
+n_save = 50_000_000
 
 
 # =====================
@@ -32,40 +42,120 @@ class RewardLoggerCallback(BaseCallback):
 
 
 # =====================
-# checkpoint
+# Checkpoint + Eval
 # =====================
-def save_checkpoint(model, save_dir="checkpoints"):
-    os.makedirs(save_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(save_dir, f"model_{timestamp}")
-    model.save(path)
-    print(f"✅ checkpoint保存: {path}.zip")
+class CheckpointEvalCallback(BaseCallback):
+    def __init__(self, eval_freq, checkpoint_dir, fig_dir):
+        super().__init__()
+        self.eval_freq = eval_freq
+        self.checkpoint_dir = checkpoint_dir
+        self.fig_dir = fig_dir
+        self.last_eval = 0
 
+    def _on_step(self):
+        if self.num_timesteps - self.last_eval >= self.eval_freq:
+            print(f"\n✅ Eval at step {self.num_timesteps}")
+            self.last_eval = self.num_timesteps
+            self.run_eval(tag=str(self.num_timesteps))
+        return True
 
-def load_latest_checkpoint(env, save_dir="checkpoints"):
-    if not os.path.exists(save_dir):
-        return None
+    def _on_training_end(self):
+        print("\n✅ Final Evaluation")
+        self.run_eval(tag="final")
 
-    files = [f for f in os.listdir(save_dir) if f.endswith(".zip")]
-    if len(files) == 0:
-        return None
+    def run_eval(self, tag):
 
-    latest = sorted(files)[-1]
-    path = os.path.join(save_dir, latest)
+        # =====================
+        # checkpoint保存
+        # =====================
+        model_path = os.path.join(self.checkpoint_dir, f"model_{tag}")
+        self.model.save(model_path)
 
-    print(f"✅ 最新checkpointロード: {path}")
-    return PPO.load(path, env=env)
+        # =====================
+        # 評価環境
+        # =====================
+        env = gym.make("Humanoid-v5", render_mode="rgb_array")
+        env = SimpleRewardWrapper(env)
+
+        obs, _ = env.reset()
+
+        frames = []
+        qpos_history = []
+        qvel_history = []
+        action_history = []
+
+        for step in range(1000):
+            action, _ = self.model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, _ = env.step(action)
+
+            frames.append(env.render())
+
+            data = env.unwrapped.data
+            qpos_history.append(data.qpos.copy())
+            qvel_history.append(data.qvel.copy())
+            action_history.append(action)
+
+            if terminated or truncated:
+                print(f"✅ 転倒 at step {step}")
+                break
+
+        env.close()
+
+        # =====================
+        # GIF保存
+        # =====================
+        gif_path = os.path.join(self.fig_dir, f"eval_{tag}.gif")
+        imageio.mimsave(gif_path, frames, fps=30)
+
+        # =====================
+        # データ整形
+        # =====================
+        qpos_history = np.array(qpos_history)
+        qvel_history = np.array(qvel_history)
+        action_history = np.array(action_history)
+
+        q = qpos_history[:, 7:]
+        qd = qvel_history[:, 6:]
+
+        # =====================
+        # qpos
+        # =====================
+        plt.figure()
+        for i in range(q.shape[1]):
+            plt.plot(q[:, i])
+        plt.title(f"qpos_{tag}")
+        plt.savefig(os.path.join(self.fig_dir, f"qpos_{tag}.png"))
+        plt.close()
+
+        # =====================
+        # qvel
+        # =====================
+        plt.figure()
+        for i in range(qd.shape[1]):
+            plt.plot(qd[:, i])
+        plt.title(f"qvel_{tag}")
+        plt.savefig(os.path.join(self.fig_dir, f"qvel_{tag}.png"))
+        plt.close()
+
+        # =====================
+        # action
+        # =====================
+        plt.figure()
+        for i in range(action_history.shape[1]):
+            plt.plot(action_history[:, i])
+        plt.title(f"action_{tag}")
+        plt.savefig(os.path.join(self.fig_dir, f"action_{tag}.png"))
+        plt.close()
 
 
 # =====================
-# シンプルReward Wrapper
+# Reward Wrapper
 # =====================
 class SimpleRewardWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
 
     def step(self, action):
-        # pure RL（without controller）
         obs, _, terminated, truncated, info = self.env.step(action)
 
         data = self.env.unwrapped.data
@@ -76,16 +166,12 @@ class SimpleRewardWrapper(gym.Wrapper):
         qd = qvel[6:]
         height = qpos[2]
 
-        weight_q = np.array([1.0] * len(q))  # 姿勢維持の重み
-        weight_q[1] = 15.0  # 姿勢維持の重み
-
-        # 報酬
         reward = 0.0
-        reward -= 0.1 * np.sum(weight_q * np.square(q)) # 姿勢維持
-        reward += 0.01 * height               # 高さ維持
-        # reward -= 0.00001 * np.sum(qd**2)      # 動きすぎ罰
+        reward -= 0.1 * np.sum(q**2)
+        reward += 0.1 * height
+        reward -= 0.000001 * np.sum(qd**2)
+        reward += 0.5
 
-        # 転倒
         if height < 0.8:
             reward -= 20.0
             terminated = True
@@ -94,137 +180,83 @@ class SimpleRewardWrapper(gym.Wrapper):
 
 
 # =====================
-# 環境
+# env生成
 # =====================
-env_train = gym.make("Humanoid-v5")
-env_train = SimpleRewardWrapper(env_train)
+def make_env():
+    def _init():
+        env = gym.make("Humanoid-v5")
+        env = SimpleRewardWrapper(env)
+        return env
+    return _init
 
 
 # =====================
-# モデル
+# train
 # =====================
-model = load_latest_checkpoint(env_train)
+def train():
 
-if model is None:
-    print("✅ 新規モデル")
+    # =====================
+    # Logsフォルダ作成
+    # =====================
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join("Logs", timestamp)
 
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    fig_dir = os.path.join(log_dir, "figs")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # =====================
+    # 環境
+    # =====================
+    env_train = SubprocVecEnv([make_env() for _ in range(num_envs)])
+
+    # =====================
+    # モデル
+    # =====================
     model = PPO(
         "MlpPolicy",
         env_train,
         verbose=1,
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=128,
-        gamma=0.99,
+        n_steps=n_steps,
+        batch_size=4096,
+        gamma=0.995,
         clip_range=0.2,
-        ent_coef=0.05,  # 探索強め
+        ent_coef=0.05,
     )
-else:
-    print("✅ 再開")
+
+    # =====================
+    # Callback
+    # =====================
+    callback1 = RewardLoggerCallback()
+
+    callback2 = CheckpointEvalCallback(
+        eval_freq=n_save,
+        checkpoint_dir=checkpoint_dir,
+        fig_dir=fig_dir,
+    )
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[callback1, callback2],
+    )
+
+    env_train.close()
+
+    # =====================
+    # 学習曲線
+    # =====================
+    plt.figure()
+    plt.plot(callback1.episode_rewards)
+    plt.title("Training Reward")
+    plt.savefig(os.path.join(fig_dir, "training_reward.png"))
+    plt.close()
 
 
 # =====================
-# 学習
+# main
 # =====================
-callback = RewardLoggerCallback()
-
-model.learn(
-    total_timesteps = 500_000,
-    callback=callback
-)
-
-save_checkpoint(model)
-env_train.close()
-
-
-# =====================
-# 学習報酬プロット
-# =====================
-plt.figure()
-plt.plot(callback.episode_rewards)
-plt.title("Training Reward (Pure RL)")
-plt.xlabel("Episode")
-plt.ylabel("Reward")
-plt.savefig("training_reward.png")
-plt.close()
-
-
-# =====================
-# 評価 + 動画
-# =====================
-env = gym.make("Humanoid-v5", render_mode="rgb_array")
-env = SimpleRewardWrapper(env)
-
-model = load_latest_checkpoint(env)
-
-if model is None:
-    model = PPO.load("humanoid_posture_rl")
-
-obs, _ = env.reset()
-
-frames = []
-action_history = []
-qpos_history = []
-qvel_history = []   # ★追加
-
-for step in range(1000):
-    action, _ = model.predict(obs, deterministic=True)
-    obs, reward, terminated, truncated, _ = env.step(action)
-
-    frames.append(env.render())
-
-    data = env.unwrapped.data
-    qpos = data.qpos.copy()
-    qvel = data.qvel.copy()   # ★追加
-
-    action_history.append(action)
-    qpos_history.append(qpos)
-    qvel_history.append(qvel)  # ★追加
-
-    if terminated or truncated:
-        print(f"✅ 転倒 at step {step}")
-        break
-
-env.close()
-
-
-# =====================
-# データ整形
-# =====================
-qpos_history = np.array(qpos_history)
-qvel_history = np.array(qvel_history)
-
-q_history = qpos_history[:, 7:]
-qd_history = qvel_history[:, 6:]   # ★追加
-
-action_history = np.array(action_history)
-
-
-# =====================
-# qvel（速度）
-# =====================
-plt.figure()
-for i in range(min(5, qd_history.shape[1])):
-    plt.plot(qd_history[:, i], label=f"qvel_{i}")
-
-plt.title("Joint Velocity")
-plt.xlabel("Step")
-plt.ylabel("Velocity")
-plt.legend()
-plt.savefig("qvel.png")
-plt.close()
-
-
-# =====================
-# action
-# =====================
-plt.figure()
-for i in range(min(5, action_history.shape[1])):
-    plt.plot(action_history[:, i], label=f"action_{i}")
-
-plt.title("Action")
-plt.xlabel("Step")
-plt.ylabel("Action")
-plt.legend()
-plt.savefig("action.png")
-plt.close()
+if __name__ == "__main__":
+    train()
