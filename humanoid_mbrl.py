@@ -5,18 +5,20 @@ import imageio
 import os
 from datetime import datetime
 
-from stable_baselines3 import PPO
+from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
-
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 # =====================
 # 設定
 # =====================
-num_envs = 64
-total_timesteps = 20_000_000_000
-n_steps = 1024
-n_save = 50_000_000
+n_envs = 6
+total_timesteps = 200_000_000
+save_timesteps = 2_000_000
+
+# SAC設定
+train_freq = 1
+gradient_steps = 4
 
 
 # =====================
@@ -175,12 +177,32 @@ class SimpleRewardWrapper(gym.Wrapper):
         qd = qvel[6:]
         height = qpos[2]
 
-        reward = 0.0
-        reward -= 0.1 * np.sum(q**2)
-        reward += 0.1 * height
-        reward -= 0.000001 * np.sum(qd**2)
-        reward += 0.5
+        # --- COM ---
+        com = data.subtree_com[0]
 
+        # --- torso姿勢（quaternionの一部）
+        # qpos[3:7] = [w, x, y, z]
+        # x,y,z が0に近いほど upright
+        torso = qpos[3:7]
+
+        reward = 0.0
+
+        # ✅ 水平位置（最重要）
+        reward -= 20.0 * (com[0]**2 + com[1]**2)
+
+        # ✅ 胴体姿勢
+        reward -= 5.0 * np.sum(torso[1:]**2)
+
+        # 高さ（補助）
+        reward += 0.5 * height
+
+        # 速度ペナルティ（軽め）
+        reward -= 1e-5 * np.sum(qd**2)
+
+        # 生存
+        reward += 1.0
+
+        # 転倒
         if height < 0.8:
             reward -= 20.0
             terminated = True
@@ -189,23 +211,12 @@ class SimpleRewardWrapper(gym.Wrapper):
 
 
 # =====================
-# env生成
-# =====================
-def make_env():
-    def _init():
-        env = gym.make("Humanoid-v5")
-        env = SimpleRewardWrapper(env)
-        return env
-    return _init
-
-
-# =====================
 # train
 # =====================
 def train():
 
     # =====================
-    # Logsフォルダ作成
+    # ログ
     # =====================
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join("Logs", timestamp)
@@ -219,30 +230,39 @@ def train():
     # =====================
     # 環境
     # =====================
-    env_train = SubprocVecEnv([make_env() for _ in range(num_envs)])
+
+    def make_env():   # ★追加
+        def _init():
+            env = gym.make("Humanoid-v5")
+            env = SimpleRewardWrapper(env)
+            return env
+        return _init
+
+    env_train = DummyVecEnv([make_env() for _ in range(n_envs)])  # ★変更（2並列）
+
 
     # =====================
-    # モデル
+    # SACモデル
     # =====================
-    model = PPO(
+    model = SAC(
         "MlpPolicy",
         env_train,
         verbose=1,
         learning_rate=3e-4,
-        n_steps=n_steps,
-        batch_size=4096,
+        buffer_size=1_000_000,
+        batch_size=256,
         gamma=0.995,
-        clip_range=0.2,
-        ent_coef=0.05,
+        tau=0.005,
+        train_freq=train_freq,
+        gradient_steps=gradient_steps,
+        ent_coef="auto",   # SACのエントロピー係数を自動調整
+        device="cuda",     # GPU使用
     )
 
-    # =====================
-    # Callback
-    # =====================
     callback1 = RewardLoggerCallback()
 
     callback2 = CheckpointEvalCallback(
-        eval_freq=n_save,
+        eval_freq=save_timesteps,
         checkpoint_dir=checkpoint_dir,
         fig_dir=fig_dir,
     )
@@ -260,6 +280,8 @@ def train():
     plt.figure()
     plt.plot(callback1.episode_rewards)
     plt.title("Training Reward")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
     plt.savefig(os.path.join(fig_dir, "training_reward.png"))
     plt.close()
 
