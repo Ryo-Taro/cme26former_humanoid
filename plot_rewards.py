@@ -44,7 +44,7 @@ class SimpleRewardWrapper(gym.Wrapper):
 # 設定
 # =====================================
 checkpoint_dir = "Logs/20260706_005225/checkpoints"   # ←変更
-n_eval_episodes = 30
+n_eval_episodes = 150
 
 env = gym.make("Humanoid-v5")
 env = SimpleRewardWrapper(env)
@@ -113,4 +113,3 @@ plt.title("Checkpoint Evaluation")
 plt.grid(True)
 
 plt.savefig("checkpoint_reward_curve.png", dpi=300)
-plt.show()
